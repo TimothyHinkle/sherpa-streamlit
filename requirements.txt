@@ -1,0 +1,6 @@
+streamlit
+requests
+google-auth
+google-cloud-storage
+google-cloud-aiplatform
+streamlit_ace
