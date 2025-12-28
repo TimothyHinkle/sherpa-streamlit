@@ -1,65 +1,88 @@
 import streamlit as st
+import inspect
 import os
-import importlib
-import time
-import threading
-from streamlit.runtime.scriptrunner import add_script_run_ctx
 
-# Set page config before any Streamlit command
 st.set_page_config(layout="wide")
+st.title("Request + Auth Introspection")
 
-# Initialize last_interaction in session state
-if "last_interaction" not in st.session_state:
-    st.session_state.last_interaction = time.time()
+req = st.request
+headers = dict(req.headers)
 
-# Removed the timeout window logic and reload button
-# Reverted to the previous implementation of runtime limit enforcement
+# -------------------------
+# 1. Raw request dump
+# -------------------------
+st.header("Raw request headers")
+st.json(headers)
 
-def enforce_runtime_limit():
-    def shutdown_timer():
-        while True:
-            if "last_interaction" in st.session_state:
-                time_since_last_interaction = time.time() - st.session_state.last_interaction
-                if time_since_last_interaction > 60*20:  # 20 minutes timeout
-                    os._exit(0)  # Forcefully exit the script
-            time.sleep(1)
+st.header("All request attributes")
+attrs = {}
+for name in dir(req):
+    if name.startswith("_"):
+        continue
+    try:
+        val = getattr(req, name)
+        if inspect.isfunction(val) or inspect.ismethod(val):
+            continue
+        attrs[name] = str(val)
+    except Exception as e:
+        attrs[name] = f"<error: {e}>"
 
-    shutdown_thread = threading.Thread(target=shutdown_timer, daemon=True)
-    add_script_run_ctx(shutdown_thread)
-    shutdown_thread.start()
+st.json(attrs)
 
-# Start the runtime limit enforcement
-enforce_runtime_limit()
+# -------------------------
+# 2. Auth resolution logic
+# -------------------------
+st.header("Auth resolution")
 
-# Update last interaction timestamp on every app rerun
-st.session_state.last_interaction = time.time()
+auth_source = None
+user_identity = None
 
-# Sidebar navigation for app selection
-APP_DIR = "apps"
-DEFAULT_APP = "google_auth.py"
+# --- Primary: IAP headers ---
+iap_email = headers.get("X-Goog-Authenticated-User-Email")
+iap_user_id = headers.get("X-Goog-Authenticated-User-ID")
 
-st.sidebar.title("Select an App")
-app_files = [f for f in os.listdir(APP_DIR) if f.endswith(".py")]
+if iap_email:
+    auth_source = "IAP"
+    user_identity = {
+        "email": iap_email,
+        "user_id": iap_user_id,
+    }
 
-if not app_files:
-    st.sidebar.write("No apps found in the directory.")
+# --- Fallback 1: query param ---
+elif "user" in st.query_params:
+    auth_source = "query_param"
+    user_identity = {
+        "email": st.query_params.get("user"),
+        "user_id": None,
+    }
+
+# --- Fallback 2: environment variable ---
+elif os.getenv("DEV_USER"):
+    auth_source = "env_var"
+    user_identity = {
+        "email": os.getenv("DEV_USER"),
+        "user_id": None,
+    }
+
+# --- Final fallback: anonymous ---
 else:
-    app_display_names = [f.replace("_", " ").replace(".py", "").title() for f in app_files]
+    auth_source = "anonymous"
+    user_identity = {
+        "email": "anonymous",
+        "user_id": None,
+    }
 
-    if DEFAULT_APP in app_files:
-        default_index = app_files.index(DEFAULT_APP)
-    else:
-        default_index = 0
+st.subheader("Resolved identity")
+st.write(user_identity)
+st.write("Auth source:", auth_source)
 
-    selected_display_name = st.sidebar.selectbox("Choose an app", app_display_names, index=default_index)
-    selected_app_file = app_files[app_display_names.index(selected_display_name)]
-
-    # Append application name to URL
-    app_name_for_url = selected_app_file.replace(".py", "")
-    st.query_params["app"] = app_name_for_url  # Corrected usage here
-
-    app_module = importlib.import_module(f"{APP_DIR}.{selected_app_file[:-3]}")
-    if hasattr(app_module, "run"):
-        app_module.run()
-    else:
-        st.write(f"The selected app '{selected_display_name}' does not have a 'run()' function.")
+# -------------------------
+# 3. Explicit failure signal
+# -------------------------
+if auth_source == "anonymous":
+    st.warning(
+        "No authenticated identity detected. "
+        "This is expected locally, but NOT behind IAP."
+    )
+else:
+    st.success(f"Authenticated via {auth_source}")
